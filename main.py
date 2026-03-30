@@ -4,11 +4,13 @@ import argparse
 import multiprocessing as mp
 import queue
 import signal
+import threading
 import time
 
 from config import ensure_directories, settings
 from database import DatabaseClient
 from utils.logging_utils import configure_logging
+from monitor import run_monitor_server
 from watcher import run_watcher
 from worker import run_worker
 
@@ -145,9 +147,25 @@ def run_pipeline() -> None:
         for idx in range(worker_count)
     ]
 
+    monitor_thread: threading.Thread | None = None
+    if settings.monitor_enabled:
+        monitor_thread = threading.Thread(
+            target=run_monitor_server,
+            args=(stop_event, stats, ingest_queue, result_queue, worker_count),
+            name="monitor-http",
+            daemon=True,
+        )
+
     watcher_process.start()
     db_writer_process.start()
     stats_process.start()
+    if monitor_thread is not None:
+        monitor_thread.start()
+        logger.info(
+            "Monitoring UI http://%s:%s",
+            settings.monitor_host,
+            settings.monitor_port,
+        )
     for process in workers:
         process.start()
     logger.info("Pipeline started with %s workers", worker_count)
@@ -166,6 +184,10 @@ def run_pipeline() -> None:
             process.join(timeout=10)
         db_writer_process.join(timeout=10)
         stats_process.join(timeout=10)
+        if monitor_thread is not None and monitor_thread.is_alive():
+            monitor_thread.join(timeout=6)
+            if monitor_thread.is_alive():
+                logger.warning("Monitor thread still alive after shutdown wait")
         logger.info("Pipeline shutdown complete")
 
 

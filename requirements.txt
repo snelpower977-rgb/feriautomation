@@ -5,3 +5,5 @@ pdf2image
 Pillow
 mysql-connector-python
 python-dotenv
+fastapi
+uvicorn[standard]

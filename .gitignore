@@ -9,7 +9,10 @@ __pycache__/
 logs/*.log
 input_folder/*
 !input_folder/.gitkeep
-processed/*
+
+# Sortie pipeline : images (jpg, png, …), PDF, etc. — ne pas versionner
+processed/**
 !processed/.gitkeep
+
 failed/*
 !failed/.gitkeep

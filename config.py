@@ -45,6 +45,15 @@ class Settings:
 
     stats_interval_seconds: int = int(os.getenv("STATS_INTERVAL_SECONDS", 60))
 
+    monitor_enabled: bool = os.getenv("MONITOR_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    monitor_host: str = os.getenv("MONITOR_HOST", "127.0.0.1")
+    monitor_port: int = int(os.getenv("MONITOR_PORT", 8765))
+    monitor_broadcast_seconds: float = float(os.getenv("MONITOR_BROADCAST_SECONDS", "1"))
+
 
 settings = Settings()
 
