@@ -7,3 +7,4 @@ mysql-connector-python
 python-dotenv
 fastapi
 uvicorn[standard]
+openai>=1.40.0

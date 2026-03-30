@@ -89,6 +89,8 @@ class DatabaseClient:
             port_loading VARCHAR(255),
             port_discharge VARCHAR(255),
             weight VARCHAR(128),
+            shipper TEXT,
+            consignee TEXT,
             raw_text LONGTEXT,
             status ENUM('pending', 'processed', 'failed') NOT NULL DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -103,6 +105,29 @@ class DatabaseClient:
             with conn.cursor() as cursor:
                 cursor.execute(ddl)
             conn.commit()
+        finally:
+            self._release(conn)
+        self._migrate_schema_add_columns(
+            [
+                ("shipper", "TEXT NULL"),
+                ("consignee", "TEXT NULL"),
+            ]
+        )
+
+    def _migrate_schema_add_columns(self, columns: list[tuple[str, str]]) -> None:
+        conn = self._checkout()
+        try:
+            with conn.cursor() as cursor:
+                for name, coltype in columns:
+                    try:
+                        cursor.execute(
+                            f"ALTER TABLE bl_documents ADD COLUMN {name} {coltype}"
+                        )
+                        conn.commit()
+                    except mysql.connector.Error as exc:
+                        if exc.errno != 1060:
+                            raise
+                        conn.rollback()
         finally:
             self._release(conn)
 
@@ -123,8 +148,9 @@ class DatabaseClient:
         query = """
         INSERT INTO bl_documents (
             id, file_name, file_hash, bl_number, booking_number, vessel,
-            port_loading, port_discharge, weight, raw_text, status
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            port_loading, port_discharge, weight, shipper, consignee,
+            raw_text, status
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             bl_number = VALUES(bl_number),
             booking_number = VALUES(booking_number),
@@ -132,6 +158,8 @@ class DatabaseClient:
             port_loading = VALUES(port_loading),
             port_discharge = VALUES(port_discharge),
             weight = VALUES(weight),
+            shipper = VALUES(shipper),
+            consignee = VALUES(consignee),
             raw_text = VALUES(raw_text),
             status = VALUES(status)
         """
@@ -146,6 +174,8 @@ class DatabaseClient:
                 record.get("port_loading"),
                 record.get("port_discharge"),
                 record.get("weight"),
+                record.get("shipper"),
+                record.get("consignee"),
                 record.get("raw_text"),
                 record.get("status", "processed"),
             )

@@ -15,7 +15,7 @@ from watcher import run_watcher
 from worker import run_worker
 
 
-def _db_writer_loop(result_queue, stop_event) -> None:
+def _db_writer_loop(result_queue, stop_event, stats) -> None:
     logger = configure_logging()
     # One writer process → one persistent connection (no pool) to save server slots.
     db_client = DatabaseClient(use_pool=False)
@@ -28,6 +28,8 @@ def _db_writer_loop(result_queue, stop_event) -> None:
             item = result_queue.get(timeout=1)
             if item is None:
                 break
+            with stats["lock"]:
+                stats["result_pending"].value = max(0, stats["result_pending"].value - 1)
             buffer.append(item)
         except queue.Empty:
             pass
@@ -95,6 +97,31 @@ def run_pipeline() -> None:
     ensure_directories()
     logger = configure_logging()
 
+    key_ok = bool((settings.openai_api_key or "").strip())
+    reg_fb = settings.openai_regex_fallback
+    if settings.openai_extraction_enabled and key_ok:
+        logger.info(
+            "Extraction: OpenAI pour les champs structurés B/L (model=%s, vision=%s)",
+            settings.openai_model,
+            settings.openai_use_vision,
+        )
+    elif settings.openai_extraction_enabled and not key_ok:
+        if reg_fb:
+            logger.warning(
+                "Extraction: clé OpenAI absente — repli regex (OPENAI_REGEX_FALLBACK=true)"
+            )
+        else:
+            logger.warning(
+                "Extraction: clé OpenAI absente — champs B/L laissés vides (OPENAI_REGEX_FALLBACK=false)"
+            )
+    else:  # not openai_extraction_enabled
+        if reg_fb:
+            logger.info("Extraction: OPENAI_EXTRACTION=false — regex pour les champs B/L")
+        else:
+            logger.info(
+                "Extraction: OPENAI_EXTRACTION=false — champs B/L vides (OPENAI_REGEX_FALLBACK=false)"
+            )
+
     db_client = DatabaseClient(use_pool=False)
     db_client.ensure_schema()
     db_client.close()
@@ -109,6 +136,9 @@ def run_pipeline() -> None:
         "processed": manager.Value("i", 0),
         "failed": manager.Value("i", 0),
         "skipped": manager.Value("i", 0),
+        # macOS Queue.qsize() is unreliable; these mirror put/get for the monitor UI
+        "ingest_pending": manager.Value("i", 0),
+        "result_pending": manager.Value("i", 0),
         "lock": manager.Lock(),
     }
 
@@ -119,10 +149,14 @@ def run_pipeline() -> None:
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-    watcher_process = mp.Process(target=run_watcher, args=(ingest_queue, seen_cache, stop_event), name="watcher")
+    watcher_process = mp.Process(
+        target=run_watcher,
+        args=(ingest_queue, seen_cache, stop_event, stats),
+        name="watcher",
+    )
     db_writer_process = mp.Process(
         target=_db_writer_loop,
-        args=(result_queue, stop_event),
+        args=(result_queue, stop_event, stats),
         name="db-writer",
     )
     stats_process = mp.Process(
@@ -151,7 +185,7 @@ def run_pipeline() -> None:
     if settings.monitor_enabled:
         monitor_thread = threading.Thread(
             target=run_monitor_server,
-            args=(stop_event, stats, ingest_queue, result_queue, worker_count),
+            args=(stop_event, stats, worker_count),
             name="monitor-http",
             daemon=True,
         )

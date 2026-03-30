@@ -85,21 +85,82 @@ def _extract_with_patterns(text: str, patterns: list[str]) -> str | None:
     return None
 
 
-def parse_bl_fields(raw_text: str) -> dict[str, str | None]:
+def parse_bl_fields(
+    raw_text: str,
+    *,
+    loose_regex_fallback: bool = True,
+) -> dict[str, str | None]:
     compact_text = _normalize_text(raw_text)
     output: dict[str, str | None] = {}
     for field, patterns in FIELD_PATTERNS.items():
         output[field] = _extract_with_patterns(compact_text, patterns)
 
-    # Fallback strategy: derive numbers if labels were missed.
-    if not output["bl_number"]:
-        fallback = re.search(r"\b([A-Z]{2,5}[0-9]{6,12})\b", compact_text)
-        if fallback:
-            output["bl_number"] = fallback.group(1)
+    # Repli agressif = beaucoup de faux positifs (ex. autre ref. transport / segment alphabétique proche).
+    # Désactivé quand OpenAI est utilisé: voir extract_structured_fields.
+    if loose_regex_fallback:
+        if not output["bl_number"]:
+            fallback = re.search(r"\b([A-Z]{2,5}[0-9]{6,12})\b", compact_text)
+            if fallback:
+                output["bl_number"] = fallback.group(1)
 
-    if not output["booking_number"]:
-        fallback = re.search(r"\b(BK|BOOK|BKG)[A-Z0-9\-]{4,}\b", compact_text, flags=re.IGNORECASE)
-        if fallback:
-            output["booking_number"] = fallback.group(0)
+        if not output["booking_number"]:
+            fallback = re.search(
+                r"\b(BK|BOOK|BKG)[A-Z0-9\-]{4,}\b", compact_text, flags=re.IGNORECASE
+            )
+            if fallback:
+                output["booking_number"] = fallback.group(0)
 
+    output["shipper"] = None
+    output["consignee"] = None
     return output
+
+
+def empty_structured_fields() -> dict[str, str | None]:
+    """Champs structurés tous absents (pipeline IA exclusive sans repli regex)."""
+    return {
+        "bl_number": None,
+        "booking_number": None,
+        "vessel": None,
+        "port_loading": None,
+        "port_discharge": None,
+        "weight": None,
+        "shipper": None,
+        "consignee": None,
+    }
+
+
+def extract_structured_fields(
+    raw_text: str, *, file_path: Path | None = None
+) -> dict[str, str | None]:
+    """IA si ``OPENAI_EXTRACTION`` + clé ; sinon champs vides, sauf si ``OPENAI_REGEX_FALLBACK=true``."""
+    key_ok = bool((settings.openai_api_key or "").strip())
+    if settings.openai_extraction_enabled and key_ok:
+        from openai_extract import extract_bl_with_openai
+
+        ai = extract_bl_with_openai(file_path, raw_text)
+        return _fields_from_ai_only(ai)
+    if settings.openai_regex_fallback:
+        return parse_bl_fields(raw_text, loose_regex_fallback=True)
+    return empty_structured_fields()
+
+
+def _fields_from_ai_only(ai: dict) -> dict[str, str | None]:
+    keys = (
+        "bl_number",
+        "booking_number",
+        "vessel",
+        "port_loading",
+        "port_discharge",
+        "weight",
+        "shipper",
+        "consignee",
+    )
+    out: dict[str, str | None] = {}
+    for k in keys:
+        v = ai.get(k)
+        if v is None:
+            out[k] = None
+            continue
+        s = str(v).strip()
+        out[k] = s if s else None
+    return out

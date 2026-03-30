@@ -6,14 +6,17 @@ import uuid
 from pathlib import Path
 
 from config import settings
-from extractor import extract_text, parse_bl_fields
+from extractor import empty_structured_fields, extract_structured_fields, extract_text
 from database import DatabaseClient
 from utils.file_utils import compute_file_hash, move_with_unique_name, wait_for_file_stability
 from utils.logging_utils import configure_logging
 
 
 def _build_record(file_path: Path, file_hash: str, raw_text: str, status: str) -> dict:
-    parsed = parse_bl_fields(raw_text) if raw_text else {}
+    if status == "processed" and raw_text:
+        parsed = extract_structured_fields(raw_text, file_path=file_path)
+    else:
+        parsed = empty_structured_fields()
     return {
         "id": str(uuid.uuid4()),
         "file_name": file_path.name,
@@ -24,6 +27,8 @@ def _build_record(file_path: Path, file_hash: str, raw_text: str, status: str) -
         "port_loading": parsed.get("port_loading"),
         "port_discharge": parsed.get("port_discharge"),
         "weight": parsed.get("weight"),
+        "shipper": parsed.get("shipper"),
+        "consignee": parsed.get("consignee"),
         "raw_text": raw_text,
         "status": status,
     }
@@ -41,6 +46,9 @@ def run_worker(worker_id, ingest_queue, result_queue, stop_event, seen_cache, st
 
         if job is None:
             break
+
+        with stats["lock"]:
+            stats["ingest_pending"].value = max(0, stats["ingest_pending"].value - 1)
 
         file_path = Path(job["path"])
         retries = int(job.get("retries", 0))
@@ -65,6 +73,8 @@ def run_worker(worker_id, ingest_queue, result_queue, stop_event, seen_cache, st
 
             record = _build_record(file_path, file_hash, raw_text, "processed")
             result_queue.put(record, timeout=2)
+            with stats["lock"]:
+                stats["result_pending"].value += 1
             move_with_unique_name(file_path, settings.processed_folder)
 
             elapsed = time.perf_counter() - start
@@ -75,6 +85,8 @@ def run_worker(worker_id, ingest_queue, result_queue, stop_event, seen_cache, st
             if retries < settings.retry_limit:
                 job["retries"] = retries + 1
                 ingest_queue.put(job)
+                with stats["lock"]:
+                    stats["ingest_pending"].value += 1
                 backoff = 2 ** retries
                 logger.warning(
                     "Worker-%s retrying %s (attempt %s/%s) after error: %s",
@@ -91,6 +103,8 @@ def run_worker(worker_id, ingest_queue, result_queue, stop_event, seen_cache, st
                 file_hash = compute_file_hash(file_path) if file_path.exists() else "missing"
                 failed_record = _build_record(file_path, file_hash, str(exc), "failed")
                 result_queue.put(failed_record, timeout=2)
+                with stats["lock"]:
+                    stats["result_pending"].value += 1
                 if file_path.exists():
                     move_with_unique_name(file_path, settings.failed_folder)
             except Exception as inner_exc:  # pylint: disable=broad-except

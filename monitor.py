@@ -14,17 +14,8 @@ from config import settings
 from utils.logging_utils import configure_logging
 
 
-def _queue_size(q) -> int | None:
-    try:
-        return q.qsize()
-    except NotImplementedError:
-        return None
-
-
 def _snapshot(
     stats: dict[str, Any],
-    ingest_queue,
-    result_queue,
     worker_count: int,
     pipeline_start: float,
     prev: dict[str, Any] | None,
@@ -34,8 +25,9 @@ def _snapshot(
         processed = stats["processed"].value
         failed = stats["failed"].value
         skipped = stats["skipped"].value
-    ingest_sz = _queue_size(ingest_queue)
-    result_sz = _queue_size(result_queue)
+        # Shared counters: macOS multiprocessing.Queue.qsize() is often unusable
+        ingest_sz = stats["ingest_pending"].value
+        result_sz = stats["result_pending"].value
     files_per_min = None
     if prev is not None and now > prev["t"]:
         dp = processed - prev["processed"]
@@ -58,8 +50,6 @@ def _snapshot(
 def create_app(
     stop_event,
     stats: dict[str, Any],
-    ingest_queue,
-    result_queue,
     worker_count: int,
     pipeline_start: float,
 ) -> FastAPI:
@@ -86,9 +76,7 @@ def create_app(
     async def api_snapshot() -> dict[str, Any]:
         nonlocal prev_snap
         now = time.time()
-        snap = _snapshot(
-            stats, ingest_queue, result_queue, worker_count, pipeline_start, prev_snap, now
-        )
+        snap = _snapshot(stats, worker_count, pipeline_start, prev_snap, now)
         rate = snap["files_per_min"]
         prev_snap = {"t": now, "processed": snap["processed"]}
         return {
@@ -110,15 +98,7 @@ def create_app(
         try:
             while not stop_event.is_set():
                 now = time.time()
-                snap = _snapshot(
-                    stats,
-                    ingest_queue,
-                    result_queue,
-                    worker_count,
-                    pipeline_start,
-                    local_prev,
-                    now,
-                )
+                snap = _snapshot(stats, worker_count, pipeline_start, local_prev, now)
                 rate = snap.get("files_per_min")
                 local_prev = {"t": now, "processed": snap["processed"]}
                 payload = {
@@ -147,8 +127,6 @@ def create_app(
 def run_monitor_server(
     stop_event,
     stats: dict[str, Any],
-    ingest_queue,
-    result_queue,
     worker_count: int,
 ) -> None:
     """Run Uvicorn in the current thread (use from a background thread in MainProcess).
@@ -162,9 +140,7 @@ def run_monitor_server(
     configure_logging()
     log = logging.getLogger("bl_pipeline")
     pipeline_start = time.time()
-    app = create_app(
-        stop_event, stats, ingest_queue, result_queue, worker_count, pipeline_start
-    )
+    app = create_app(stop_event, stats, worker_count, pipeline_start)
     config = uvicorn.Config(
         app,
         host=settings.monitor_host,

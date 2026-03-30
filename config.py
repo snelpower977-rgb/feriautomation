@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -7,6 +7,24 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
+
+
+def _env_truthy(name: str) -> bool | None:
+    v = os.getenv(name)
+    if v is None:
+        return None
+    return v.strip().lower() in ("1", "true", "yes")
+
+
+def _openai_extraction_from_env() -> bool:
+    """OPENAI_EXTRACTION prime ; sinon OPENAI_OVERRIDE_BL_FIELDS (legacy) ; défaut True."""
+    ex = _env_truthy("OPENAI_EXTRACTION")
+    if ex is not None:
+        return ex
+    leg = _env_truthy("OPENAI_OVERRIDE_BL_FIELDS")
+    if leg is not None:
+        return leg
+    return True
 
 
 @dataclass(frozen=True)
@@ -53,6 +71,34 @@ class Settings:
     monitor_host: str = os.getenv("MONITOR_HOST", "127.0.0.1")
     monitor_port: int = int(os.getenv("MONITOR_PORT", 8765))
     monitor_broadcast_seconds: float = float(os.getenv("MONITOR_BROADCAST_SECONDS", "1"))
+
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "").strip()
+    openai_extraction_enabled: bool = field(default_factory=_openai_extraction_from_env)
+    # false = jamais de regex pour les champs B/L (IA ou champs vides). true = repli regex si pas de clé / IA off.
+    openai_regex_fallback: bool = os.getenv("OPENAI_REGEX_FALLBACK", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    openai_max_input_chars: int = int(os.getenv("OPENAI_MAX_INPUT_CHARS", "24000"))
+    # Vision: render PDF / image pages and send with OCR text (better layout than text-only).
+    openai_use_vision: bool = os.getenv("OPENAI_USE_VISION", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    openai_vision_max_pages: int = int(os.getenv("OPENAI_VISION_MAX_PAGES", "3"))
+    openai_vision_max_side: int = int(os.getenv("OPENAI_VISION_MAX_SIDE", "1800"))
+    openai_vision_dpi: int = int(os.getenv("OPENAI_VISION_DPI", "160"))
+    openai_vision_jpeg_quality: int = int(os.getenv("OPENAI_VISION_JPEG_QUALITY", "82"))
+    openai_vision_extensions: tuple[str, ...] = (
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+    )
 
 
 settings = Settings()
