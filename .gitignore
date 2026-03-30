@@ -1,0 +1,15 @@
+.venv/
+venv/
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+logs/*.log
+input_folder/*
+!input_folder/.gitkeep
+processed/*
+!processed/.gitkeep
+failed/*
+!failed/.gitkeep

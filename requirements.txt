@@ -1,0 +1,7 @@
+watchdog
+pdfplumber
+pytesseract
+pdf2image
+Pillow
+mysql-connector-python
+python-dotenv
