@@ -113,6 +113,7 @@ class DatabaseClient:
                 ("consignee", "TEXT NULL"),
             ]
         )
+        self._ensure_audit_view()
 
     def _migrate_schema_add_columns(self, columns: list[tuple[str, str]]) -> None:
         conn = self._checkout()
@@ -131,8 +132,36 @@ class DatabaseClient:
         finally:
             self._release(conn)
 
+    def _ensure_audit_view(self) -> None:
+        ddl = """
+        CREATE OR REPLACE VIEW v_bl_documents_audit AS
+        SELECT
+            id,
+            file_name,
+            file_hash,
+            status,
+            created_at,
+            bl_number,
+            booking_number,
+            CASE WHEN file_hash = 'missing' THEN 1 ELSE 0 END AS is_missing_hash,
+            CASE
+                WHEN COALESCE(NULLIF(TRIM(bl_number), ''), NULLIF(TRIM(booking_number), '')) IS NULL
+                THEN 1 ELSE 0
+            END AS is_identity_missing
+        FROM bl_documents
+        """
+        conn = self._checkout()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(ddl)
+            conn.commit()
+        finally:
+            self._release(conn)
+
     def file_hash_exists(self, file_hash: str) -> bool:
-        query = "SELECT 1 FROM bl_documents WHERE file_hash = %s LIMIT 1"
+        # Deduplicate only against successfully processed documents.
+        # Failed/partial attempts must not cause future files to be skipped.
+        query = "SELECT 1 FROM bl_documents WHERE file_hash = %s AND status = 'processed' LIMIT 1"
         conn = self._checkout()
         try:
             with conn.cursor() as cursor:
@@ -195,6 +224,48 @@ class DatabaseClient:
         SELECT COUNT(*) FROM bl_documents
         WHERE status = 'processed'
           AND created_at >= (NOW() - INTERVAL %s MINUTE)
+        """
+        conn = self._checkout()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (minutes,))
+                row = cursor.fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            self._release(conn)
+
+    def count_processed_total(self) -> int:
+        query = "SELECT COUNT(*) FROM bl_documents WHERE status = 'processed'"
+        conn = self._checkout()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                row = cursor.fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            self._release(conn)
+
+    def list_recent_file_names(self, minutes: int = 120) -> list[str]:
+        query = """
+        SELECT DISTINCT file_name
+        FROM bl_documents
+        WHERE created_at >= (NOW() - INTERVAL %s MINUTE)
+        """
+        conn = self._checkout()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (minutes,))
+                rows = cursor.fetchall() or []
+            return [str(r[0]) for r in rows if r and r[0]]
+        finally:
+            self._release(conn)
+
+    def count_recent_missing_hash(self, minutes: int = 120) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM v_bl_documents_audit
+        WHERE created_at >= (NOW() - INTERVAL %s MINUTE)
+          AND is_missing_hash = 1
         """
         conn = self._checkout()
         try:

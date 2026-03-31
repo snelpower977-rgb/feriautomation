@@ -16,3 +16,6 @@ processed/**
 
 failed/*
 !failed/.gitkeep
+
+skipped/*
+!skipped/.gitkeep

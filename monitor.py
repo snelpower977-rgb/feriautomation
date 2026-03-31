@@ -13,6 +13,31 @@ from fastapi.responses import HTMLResponse
 from config import settings
 from utils.logging_utils import configure_logging
 
+_db_processed_cache: int | None = None
+_db_processed_cache_t: float = 0.0
+
+
+def _get_processed_count_from_db() -> int:
+    """Source de vérité pour l’UI : aligné sur la table, même après purge SQL."""
+    global _db_processed_cache, _db_processed_cache_t
+    now = time.time()
+    ttl = max(0.5, float(getattr(settings, "monitor_broadcast_seconds", 1.0) or 1.0) * 2)
+    if _db_processed_cache is not None and now - _db_processed_cache_t < ttl:
+        return _db_processed_cache
+    try:
+        from database import DatabaseClient
+
+        client = DatabaseClient(use_pool=False)
+        try:
+            n = client.count_processed_total()
+        finally:
+            client.close()
+        _db_processed_cache = n
+        _db_processed_cache_t = now
+        return n
+    except Exception:
+        return _db_processed_cache if _db_processed_cache is not None else 0
+
 
 def _snapshot(
     stats: dict[str, Any],
@@ -22,12 +47,13 @@ def _snapshot(
     now: float,
 ) -> dict[str, Any]:
     with stats["lock"]:
-        processed = stats["processed"].value
+        processed = _get_processed_count_from_db()
         failed = stats["failed"].value
         skipped = stats["skipped"].value
         # Shared counters: macOS multiprocessing.Queue.qsize() is often unusable
         ingest_sz = stats["ingest_pending"].value
         result_sz = stats["result_pending"].value
+        activity = list(stats.get("activity") or [])[-120:]
     files_per_min = None
     if prev is not None and now > prev["t"]:
         dp = processed - prev["processed"]
@@ -44,6 +70,7 @@ def _snapshot(
         "queue_max": settings.queue_max_size,
         "workers": worker_count,
         "files_per_min": None if files_per_min is None else round(files_per_min, 2),
+        "activity": activity,
     }
 
 
@@ -89,6 +116,7 @@ def create_app(
             "queue_max": snap["queue_max"],
             "workers": snap["workers"],
             "files_per_min": rate,
+            "activity": snap.get("activity") or [],
         }
 
     @app.websocket("/ws")
@@ -111,6 +139,7 @@ def create_app(
                     "queue_max": snap["queue_max"],
                     "workers": snap["workers"],
                     "files_per_min": rate,
+                    "activity": snap.get("activity") or [],
                 }
                 history.append(
                     {"t": now, "processed": snap["processed"], "rate": rate or 0}
@@ -391,6 +420,196 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       font-size: 0.85em;
     }}
     .error-msg {{ color: var(--rose); padding: 1rem; text-align: center; font-weight: 600; }}
+    .journal-above-queue {{ margin-top: 1.35rem; width: 100%; }}
+    .live-wrap {{ margin-top: 1.35rem; display: grid; gap: 1.25rem; }}
+    @media (min-width: 960px) {{ .live-wrap {{ grid-template-columns: 1fr 1fr; align-items: start; }} }}
+    .live-panel {{
+      padding: 1.25rem 1.35rem;
+      border-radius: 20px;
+      background: var(--glass);
+      backdrop-filter: blur(14px);
+      border: 1px solid var(--glass-border);
+      box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+      min-height: 120px;
+    }}
+    .live-panel h2 {{
+      margin: 0 0 1rem;
+      font-size: 0.88rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }}
+    .live-panel h2 .badge {{
+      font-size: 0.65rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 0.2rem 0.5rem;
+      border-radius: 6px;
+      background: rgba(34,211,238,0.15);
+      color: var(--cyan);
+      border: 1px solid rgba(34,211,238,0.25);
+    }}
+    .proc-grid {{ display: flex; flex-wrap: wrap; gap: 0.85rem; }}
+    .proc-empty {{
+      font-size: 0.85rem;
+      color: var(--muted);
+      font-weight: 500;
+      padding: 0.5rem 0;
+    }}
+    .proc-card {{
+      flex: 1 1 240px;
+      max-width: 100%;
+      padding: 1rem 1.15rem;
+      border-radius: 16px;
+      border: 1px solid rgba(167,139,250,0.35);
+      background: linear-gradient(
+        135deg,
+        rgba(124,58,237,0.22) 0%,
+        rgba(34,211,238,0.12) 50%,
+        rgba(124,58,237,0.18) 100%
+      );
+      background-size: 220% 220%;
+      animation: cardGlow 4s ease-in-out infinite;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset, 0 12px 40px rgba(124,58,237,0.15);
+    }}
+    .proc-card::before {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(
+        110deg,
+        transparent 0%,
+        rgba(255,255,255,0.07) 45%,
+        rgba(255,255,255,0.14) 50%,
+        rgba(255,255,255,0.07) 55%,
+        transparent 100%
+      );
+      background-size: 220% 100%;
+      animation: shimmer 2.4s ease-in-out infinite;
+      pointer-events: none;
+    }}
+    @keyframes shimmer {{
+      0% {{ background-position: 200% 0; }}
+      100% {{ background-position: -200% 0; }}
+    }}
+    @keyframes cardGlow {{
+      0%, 100% {{ background-position: 0% 50%; }}
+      50% {{ background-position: 100% 50%; }}
+    }}
+    .proc-card .fn {{
+      position: relative;
+      z-index: 1;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--text);
+      margin-bottom: 0.65rem;
+      word-break: break-all;
+    }}
+    .proc-card .meta {{
+      position: relative;
+      z-index: 1;
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-weight: 500;
+    }}
+    .dots {{
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      vertical-align: middle;
+      margin-left: 0.35rem;
+    }}
+    .dots span {{
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 10px var(--cyan);
+      animation: dotBounce 1.15s ease-in-out infinite;
+    }}
+    .dots span:nth-child(2) {{ animation-delay: 0.15s; }}
+    .dots span:nth-child(3) {{ animation-delay: 0.3s; }}
+    @keyframes dotBounce {{
+      0%, 80%, 100% {{ transform: translateY(0) scale(0.75); opacity: 0.35; }}
+      40% {{ transform: translateY(-5px) scale(1); opacity: 1; }}
+    }}
+    .wait-card {{
+      flex: 1 1 200px;
+      padding: 0.85rem 1rem;
+      border-radius: 14px;
+      border: 1px solid var(--glass-border);
+      background: rgba(255,255,255,0.04);
+    }}
+    .wait-card .pulse-ring {{
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--amber);
+      margin-right: 0.45rem;
+      box-shadow: 0 0 0 0 rgba(251,191,36,0.55);
+      animation: ringPulse 1.8s ease-out infinite;
+    }}
+    @keyframes ringPulse {{
+      0% {{ box-shadow: 0 0 0 0 rgba(251,191,36,0.5); }}
+      70% {{ box-shadow: 0 0 0 10px rgba(251,191,36,0); }}
+      100% {{ box-shadow: 0 0 0 0 rgba(251,191,36,0); }}
+    }}
+    .log-scroll {{
+      max-height: 340px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding-right: 0.25rem;
+      margin: 0 -0.15rem;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(167,139,250,0.45) transparent;
+    }}
+    .log-scroll::-webkit-scrollbar {{ width: 6px; }}
+    .log-scroll::-webkit-scrollbar-thumb {{
+      background: rgba(167,139,250,0.4);
+      border-radius: 99px;
+    }}
+    .log-line {{
+      display: grid;
+      grid-template-columns: 4.2rem 1fr;
+      gap: 0.65rem 0.85rem;
+      align-items: start;
+      padding: 0.55rem 0.65rem;
+      margin-bottom: 0.35rem;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.2);
+      border: 1px solid rgba(255,255,255,0.05);
+      font-size: 0.8rem;
+      animation: logIn 0.35s ease-out;
+    }}
+    @keyframes logIn {{
+      from {{ opacity: 0; transform: translateX(-6px); }}
+      to {{ opacity: 1; transform: translateX(0); }}
+    }}
+    .log-line .ts {{ font-variant-numeric: tabular-nums; color: var(--muted); font-size: 0.72rem; font-weight: 600; padding-top: 0.15rem; }}
+    .log-line .body {{ min-width: 0; }}
+    .log-line .lbl {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-weight: 600;
+      margin-bottom: 0.2rem;
+    }}
+    .log-line .file {{ color: var(--text); word-break: break-all; font-weight: 500; }}
+    .log-line .detail {{ color: var(--muted); font-size: 0.74rem; margin-top: 0.15rem; line-height: 1.35; }}
+    .tag {{ font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.15rem 0.45rem; border-radius: 6px; }}
+    .tag.q {{ background: rgba(251,191,36,0.18); color: var(--amber); border: 1px solid rgba(251,191,36,0.3); }}
+    .tag.p {{ background: rgba(34,211,238,0.18); color: var(--cyan); border: 1px solid rgba(34,211,238,0.3); }}
+    .tag.d {{ background: rgba(52,211,153,0.18); color: var(--green); border: 1px solid rgba(52,211,153,0.25); }}
+    .tag.f {{ background: rgba(251,113,133,0.18); color: var(--rose); border: 1px solid rgba(251,113,133,0.3); }}
+    .tag.s {{ background: rgba(129,140,248,0.2); color: #c7d2fe; border: 1px solid rgba(129,140,248,0.3); }}
+    .tag.r {{ background: rgba(244,114,182,0.15); color: #f9a8d4; border: 1px solid rgba(244,114,182,0.25); }}
+    .tag.sk {{ background: rgba(251,191,36,0.12); color: #fcd34d; border: 1px solid rgba(251,191,36,0.2); }}
   </style>
 </head>
 <body style="margin:0;font-family:'Poppins',system-ui,sans-serif;background:#0c0b1a;color:#f4f6ff;">
@@ -430,6 +649,20 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="metric neutral">
         <div class="metric-top"><h3>Workers</h3><span class="ico">⊛</span></div>
         <div class="val" id="workers">—</div>
+      </div>
+    </div>
+    <div class="live-panel journal-above-queue">
+      <h2>Journal des actions <span class="badge" id="logBadge" style="background:rgba(167,139,250,0.15);color:var(--violet);border-color:rgba(167,139,250,0.25);">temps réel</span></h2>
+      <div id="activityLog" class="log-scroll"></div>
+    </div>
+    <div class="live-wrap">
+      <div class="live-panel">
+        <h2>Traitement en cours <span class="badge" id="procBadge">0</span></h2>
+        <div id="processingCards" class="proc-grid"></div>
+      </div>
+      <div class="live-panel">
+        <h2>En attente <span class="badge" id="waitBadge" style="background:rgba(251,191,36,0.15);color:var(--amber);border-color:rgba(251,191,36,0.25);">0</span></h2>
+        <div id="waitingCards" class="proc-grid"></div>
       </div>
     </div>
     <div class="panel">
@@ -494,6 +727,87 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       const p = max > 0 ? Math.min(100, (n / max) * 100) : 0;
       el.style.width = p + '%';
     }}
+    function mergeJobStates(activity) {{
+      const sorted = [...activity].sort((a, b) => a.t - b.t);
+      const map = new Map();
+      for (const ev of sorted) {{
+        const jid = ev.job_id || '';
+        const key = jid || ('anon:' + ev.file + ':' + ev.t);
+        const prev = map.get(key) || {{}};
+        map.set(key, {{
+          job_id: ev.job_id || prev.job_id,
+          file: ev.file || prev.file,
+          lastKind: ev.kind,
+          lastT: ev.t,
+          worker_id: ev.worker_id != null ? ev.worker_id : prev.worker_id,
+        }});
+      }}
+      return Array.from(map.values()).filter((j) => j.file);
+    }}
+    function tagForKind(kind) {{
+      const m = {{
+        queued: ['q', 'File'],
+        processing: ['p', 'Traitement'],
+        done: ['d', 'Terminé'],
+        saved: ['s', 'Base'],
+        failed: ['f', 'Échec'],
+        retry: ['r', 'Retry'],
+        skipped_duplicate: ['sk', 'Doublon'],
+        already_done: ['s', 'Déjà traité'],
+        missing_after_retries: ['f', 'Introuvable'],
+        failed_no_db: ['f', 'Échec'],
+      }};
+      const x = m[kind] || ['s', String(kind)];
+      return {{ cls: x[0], label: x[1] }};
+    }}
+    function fmtClock(t) {{
+      const d = new Date(t * 1000);
+      return d.toLocaleTimeString('fr-FR', {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+    }}
+    function renderLiveActivity(activity) {{
+      const act = activity || [];
+      const jobs = mergeJobStates(act);
+      const processing = jobs.filter((j) => j.lastKind === 'processing');
+      const waiting = jobs.filter((j) => j.lastKind === 'queued' || j.lastKind === 'retry');
+      const procEl = document.getElementById('processingCards');
+      const waitEl = document.getElementById('waitingCards');
+      document.getElementById('procBadge').textContent = String(processing.length);
+      document.getElementById('waitBadge').textContent = String(waiting.length);
+      if (processing.length === 0) {{
+        procEl.innerHTML = '<p class="proc-empty">Aucun fichier en cours d’extraction.</p>';
+      }} else {{
+        procEl.innerHTML = processing.map((j) => {{
+          const w = j.worker_id != null ? 'Worker ' + j.worker_id : '';
+          return '<div class="proc-card" role="status">'
+            + '<div class="fn">' + (j.file || '') + '</div>'
+            + '<div class="meta">' + w + ' · IA + OCR<span class="dots" aria-hidden="true"><span></span><span></span><span></span></span></div>'
+            + '</div>';
+        }}).join('');
+      }}
+      if (waiting.length === 0) {{
+        waitEl.innerHTML = '<p class="proc-empty">File d’attente vide.</p>';
+      }} else {{
+        waitEl.innerHTML = waiting.map((j) => {{
+          const lbl = j.lastKind === 'retry' ? 'Nouvel essai' : 'En file';
+          return '<div class="wait-card"><span class="pulse-ring"></span><strong>' + (j.file || '') + '</strong><div class="meta" style="margin-top:0.35rem">' + lbl + '</div></div>';
+        }}).join('');
+      }}
+      const logEl = document.getElementById('activityLog');
+      const lines = [...act].sort((a, b) => b.t - a.t).slice(0, 80);
+      logEl.innerHTML = lines.map((ev) => {{
+        const tg = tagForKind(ev.kind);
+        let detail = '';
+        if (ev.seconds != null) detail += ev.seconds + ' s';
+        if (ev.worker_id != null) detail += (detail ? ' · ' : '') + 'Worker ' + ev.worker_id;
+        if (ev.attempt != null) detail += (detail ? ' · ' : '') + 'essai ' + ev.attempt;
+        if (ev.error) detail += (detail ? ' — ' : '') + ev.error;
+        return '<div class="log-line"><div class="ts">' + fmtClock(ev.t) + '</div><div class="body">'
+          + '<div class="lbl"><span class="tag ' + tg.cls + '">' + tg.label + '</span></div>'
+          + '<div class="file">' + (ev.file || '') + '</div>'
+          + (detail ? '<div class="detail">' + detail + '</div>' : '')
+          + '</div></div>';
+      }}).join('');
+    }}
     function connect() {{
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(proto + '//' + location.host + '/ws');
@@ -528,6 +842,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
           rates.push(pt.rate != null ? pt.rate : 0);
         }});
         if (chart) chart.update('none');
+        renderLiveActivity(d.activity || []);
       }};
     }}
     initChart();
